@@ -218,3 +218,6 @@ __marimo__/
 # Local journal files. I don't wanna see your privacy leaks.
 journal.json
 journal.sqlite3
+
+# Developing ideas
+.dev_res/
