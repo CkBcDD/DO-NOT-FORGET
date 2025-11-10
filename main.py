@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSplitter,
     QStyle,
     QSystemTrayIcon,
@@ -64,10 +65,14 @@ TEMPLATE_ENV = Environment(
             "entry_detail.html": dedent(
                 """\
                 <div style='font-family:"Segoe UI",sans-serif; line-height:1.6; color:{{ colors.text }};'>
-                    <div style='display:flex; gap:12px; align-items:center; margin-bottom:12px;'>
+                    <div style='display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; justify-content:space-between; margin-bottom:12px;'>
                         <div>
                             <div style='font-size:16px; font-weight:bold;'>{{ timestamp_display }}</div>
                             <div style='color:{{ colors.secondary }};'>情绪 Mood: {{ mood_display }}</div>
+                        </div>
+                        <div style='display:flex; flex-wrap:wrap; gap:18px; color:{{ colors.secondary }}; font-size:14px;'>
+                            <div>情绪强度 Intensity: <strong style='color:{{ colors.text }};'>{{ emotion_intensity }}/5</strong></div>
+                            <div>能量水平 Energy: <strong style='color:{{ colors.text }};'>{{ energy_level }}/5</strong></div>
                         </div>
                     </div>
                     {% if structured_fields %}
@@ -112,6 +117,18 @@ class JournalEntry:
     body_sensation: str = ""
     trigger_event: str = ""
     need_boundary: str = ""
+    emotion_intensity: int = 3
+    energy_level: int = 3
+
+
+def clamp_scale_value(raw: object, default: int = 3) -> int:
+    """Convert raw slider-like values to the canonical 1-5 scale."""
+
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        value = default
+    return max(1, min(5, value))
 
 
 def format_timestamp_display(timestamp: str) -> str:
@@ -150,6 +167,9 @@ def render_entry_detail_html(entry: JournalEntry, dark_mode: bool = False) -> st
     colors = review_theme_colors(dark_mode)
     structured_fields: list[dict[str, str]] = []
 
+    intensity_value = clamp_scale_value(entry.emotion_intensity)
+    energy_value = clamp_scale_value(entry.energy_level)
+
     field_specs = (
         ("身体感受 Body Sensation", entry.body_sensation),
         ("触发事件 Trigger", entry.trigger_event),
@@ -165,6 +185,8 @@ def render_entry_detail_html(entry: JournalEntry, dark_mode: bool = False) -> st
         colors=colors,
         timestamp_display=format_timestamp_display(entry.timestamp),
         mood_display=MOOD_DISPLAY_LOOKUP.get(entry.mood, entry.mood),
+        emotion_intensity=intensity_value,
+        energy_level=energy_value,
         structured_fields=structured_fields,
         body_text=entry.text,
         has_body=bool(entry.text.strip()),
@@ -195,7 +217,9 @@ def initialize_storage(db_path: Path, legacy_json_path: Path) -> None:
                     text TEXT NOT NULL,
                     body_sensation TEXT NOT NULL DEFAULT '',
                     trigger_event TEXT NOT NULL DEFAULT '',
-                    need_boundary TEXT NOT NULL DEFAULT ''
+                    need_boundary TEXT NOT NULL DEFAULT '',
+                    emotion_intensity INTEGER NOT NULL DEFAULT 3,
+                    energy_level INTEGER NOT NULL DEFAULT 3
                 )
                 """
             )
@@ -226,6 +250,8 @@ def ensure_structured_fields(conn: sqlite3.Connection) -> None:
         "body_sensation": "ALTER TABLE moments ADD COLUMN body_sensation TEXT NOT NULL DEFAULT ''",
         "trigger_event": "ALTER TABLE moments ADD COLUMN trigger_event TEXT NOT NULL DEFAULT ''",
         "need_boundary": "ALTER TABLE moments ADD COLUMN need_boundary TEXT NOT NULL DEFAULT ''",
+        "emotion_intensity": "ALTER TABLE moments ADD COLUMN emotion_intensity INTEGER NOT NULL DEFAULT 3",
+        "energy_level": "ALTER TABLE moments ADD COLUMN energy_level INTEGER NOT NULL DEFAULT 3",
     }
 
     for column_name, alter_sql in column_specs.items():
@@ -254,7 +280,7 @@ def migrate_legacy_json(json_path: Path, db_path: Path) -> None:
         return
 
     raw_moments = data.get("moments", []) if isinstance(data, dict) else []
-    payload: list[tuple[int, str, str, str, str, str, str]] = []
+    payload: list[tuple[int, str, str, str, str, str, str, int, int]] = []
     for entry in raw_moments:
         if not isinstance(entry, dict):
             continue
@@ -275,6 +301,8 @@ def migrate_legacy_json(json_path: Path, db_path: Path) -> None:
             body_sensation = body_sensation.strip()[:30]
             trigger_event = trigger_event.strip()[:30]
             need_boundary = need_boundary.strip()[:30]
+            emotion_intensity = clamp_scale_value(entry.get("emotion_intensity"), 3)
+            energy_level = clamp_scale_value(entry.get("energy_level"), 3)
         except (TypeError, ValueError):
             logging.exception(
                 "Skipping invalid legacy entry during migration: %s", entry
@@ -289,6 +317,8 @@ def migrate_legacy_json(json_path: Path, db_path: Path) -> None:
                 body_sensation,
                 trigger_event,
                 need_boundary,
+                emotion_intensity,
+                energy_level,
             )
         )
 
@@ -310,8 +340,10 @@ def migrate_legacy_json(json_path: Path, db_path: Path) -> None:
                     text,
                     body_sensation,
                     trigger_event,
-                    need_boundary
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    need_boundary,
+                    emotion_intensity,
+                    energy_level
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 payload,
             )
@@ -329,6 +361,8 @@ def append_entry_to_journal(
     body_sensation: str = "",
     trigger_event: str = "",
     need_boundary: str = "",
+    emotion_intensity: int = 3,
+    energy_level: int = 3,
 ) -> None:
     """Persist a new journal entry into the SQLite database."""
 
@@ -339,6 +373,8 @@ def append_entry_to_journal(
     body_sensation = ((body_sensation or "").strip())[:30]
     trigger_event = ((trigger_event or "").strip())[:30]
     need_boundary = ((need_boundary or "").strip())[:30]
+    intensity_value = clamp_scale_value(emotion_intensity)
+    energy_value = clamp_scale_value(energy_level)
 
     new_entry = JournalEntry(
         id=entry_id,
@@ -348,6 +384,8 @@ def append_entry_to_journal(
         body_sensation=body_sensation,
         trigger_event=trigger_event,
         need_boundary=need_boundary,
+        emotion_intensity=intensity_value,
+        energy_level=energy_value,
     )
 
     try:
@@ -363,8 +401,10 @@ def append_entry_to_journal(
                             text,
                             body_sensation,
                             trigger_event,
-                            need_boundary
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            need_boundary,
+                            emotion_intensity,
+                            energy_level
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             new_entry.id,
@@ -374,15 +414,17 @@ def append_entry_to_journal(
                             new_entry.body_sensation,
                             new_entry.trigger_event,
                             new_entry.need_boundary,
+                            new_entry.emotion_intensity,
+                            new_entry.energy_level,
                         ),
                     )
-                    break
                 except sqlite3.IntegrityError:
                     new_entry.id += 1
-            else:
-                raise sqlite3.IntegrityError(
-                    "Failed to generate unique journal entry ID"
-                )
+                    continue
+
+                return
+
+            raise sqlite3.IntegrityError("Failed to generate unique journal entry ID")
     except sqlite3.DatabaseError:
         logging.exception("Failed to append journal entry to database.")
         raise
@@ -406,7 +448,9 @@ def load_journal_entries(db_path: Path) -> list[JournalEntry]:
                     text,
                     body_sensation,
                     trigger_event,
-                    need_boundary
+                    need_boundary,
+                    emotion_intensity,
+                    energy_level
                 FROM moments
                 ORDER BY timestamp DESC, id DESC
                 """
@@ -415,22 +459,33 @@ def load_journal_entries(db_path: Path) -> list[JournalEntry]:
         logging.exception("Failed to load journal entries from SQLite.")
         return []
 
+    if not rows:
+        return []
+
     entries: list[JournalEntry] = []
     for row in rows:
+        row_dict = dict(row)
         try:
             entries.append(
                 JournalEntry(
-                    id=int(row["id"]) if row["id"] is not None else 0,
-                    timestamp=str(row["timestamp"] or ""),
-                    mood=str(row["mood"] or "unspecified"),
-                    text=str(row["text"] or ""),
-                    body_sensation=str(row["body_sensation"] or ""),
-                    trigger_event=str(row["trigger_event"] or ""),
-                    need_boundary=str(row["need_boundary"] or ""),
+                    id=int(row_dict.get("id", 0))
+                    if row_dict.get("id") is not None
+                    else 0,
+                    timestamp=str(row_dict.get("timestamp", "")),
+                    mood=str(row_dict.get("mood", "unspecified")),
+                    text=str(row_dict.get("text", "")),
+                    body_sensation=str(row_dict.get("body_sensation", "")),
+                    trigger_event=str(row_dict.get("trigger_event", "")),
+                    need_boundary=str(row_dict.get("need_boundary", "")),
+                    emotion_intensity=clamp_scale_value(
+                        row_dict.get("emotion_intensity")
+                    ),
+                    energy_level=clamp_scale_value(row_dict.get("energy_level")),
                 )
             )
         except (TypeError, ValueError):
-            logging.exception("Skipping malformed database row: %s", dict(row))
+            logging.exception("Skipping malformed database row: %s", row_dict)
+            continue
 
     return entries
 
@@ -454,6 +509,8 @@ def export_journal_to_csv(db_path: Path, csv_path: Path) -> int:
                     "body_sensation",
                     "trigger_event",
                     "need_boundary",
+                    "emotion_intensity",
+                    "energy_level",
                 ]
             )
             for entry in reversed(entries):
@@ -466,6 +523,8 @@ def export_journal_to_csv(db_path: Path, csv_path: Path) -> int:
                         entry.body_sensation,
                         entry.trigger_event,
                         entry.need_boundary,
+                        entry.emotion_intensity,
+                        entry.energy_level,
                     ]
                 )
     except OSError:
@@ -492,6 +551,38 @@ class MemoWindow(QWidget):
         for label, value in MOOD_CHOICES:
             self.mood_selector.addItem(label, userData=value)
         layout.addWidget(self.mood_selector)
+
+        def _add_slider_row(label_text: str, tooltip: str) -> tuple[QSlider, QLabel]:
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(1, 5)
+            slider.setTickInterval(1)
+            slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            slider.setValue(3)
+            slider.setToolTip(tooltip)
+
+            value_label = QLabel(str(slider.value()))
+            value_label.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            value_label.setMinimumWidth(24)
+
+            row = QHBoxLayout()
+            row_label = QLabel(label_text)
+            row.addWidget(row_label)
+            row.addWidget(slider)
+            row.addWidget(value_label)
+            layout.addLayout(row)
+            return slider, value_label
+
+        self.intensity_slider, self.intensity_value_label = _add_slider_row(
+            "情绪强度 Intensity (1–5):", "记录当下感受的强烈程度，1=轻微，5=非常强烈"
+        )
+        self.intensity_slider.valueChanged.connect(self.on_intensity_value_changed)
+
+        self.energy_slider, self.energy_value_label = _add_slider_row(
+            "能量水平 Energy (1–5):", "记录当下的能量充沛度，1=低能量，5=高能量"
+        )
+        self.energy_slider.valueChanged.connect(self.on_energy_value_changed)
 
         self.body_input = QLineEdit()
         self.trigger_input = QLineEdit()
@@ -589,6 +680,12 @@ class MemoWindow(QWidget):
 
         self.counter.setText(f"{len(text)} / {ENTRY_CHARACTER_LIMIT}")
 
+    def on_intensity_value_changed(self, value: int) -> None:
+        self.intensity_value_label.setText(str(clamp_scale_value(value)))
+
+    def on_energy_value_changed(self, value: int) -> None:
+        self.energy_value_label.setText(str(clamp_scale_value(value)))
+
     def archive_entry(self) -> None:
         text = self.text_edit.toPlainText().strip()
         if not text:
@@ -612,21 +709,46 @@ class MemoWindow(QWidget):
                 body_sensation=body_sensation,
                 trigger_event=trigger_event,
                 need_boundary=need_boundary,
+                emotion_intensity=self.intensity_slider.value(),
+                energy_level=self.energy_slider.value(),
             )
         except Exception as exc:  # broad catch to surface unexpected errors
             logging.exception("Failed to archive entry")
             QMessageBox.critical(self, "Archive Failed", f"Could not save file: {exc}")
             return
 
-        QMessageBox.information(
-            self, "Archived", f"Entry archived to {DATABASE_PATH.resolve()}"
-        )
+        self.notify_entry_archived()
 
         self.text_edit.clear()
         self.body_input.clear()
         self.trigger_input.clear()
         self.need_input.clear()
+        self.intensity_slider.setValue(3)
+        self.energy_slider.setValue(3)
         self.refresh_history()
+
+    def notify_entry_archived(self) -> None:
+        """Send a lightweight confirmation when an entry is saved."""
+
+        notification_body = f"Entry archived to {DATABASE_PATH.resolve()}"
+
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            icon_was_visible = self.tray_icon.isVisible()
+
+            if not icon_was_visible:
+                self.tray_icon.show()
+
+            self.tray_icon.showMessage(
+                "DO-NOT-FORGET",
+                notification_body,
+                QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
+
+            if not icon_was_visible:
+                QTimer.singleShot(2600, self.tray_icon.hide)
+        else:
+            logging.info(notification_body)
 
     def minimize_to_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -707,6 +829,9 @@ class MemoWindow(QWidget):
             mood_display = MOOD_DISPLAY_LOOKUP.get(entry.mood, entry.mood)
 
             display_lines = [f"[{timestamp_display}] {mood_display}"]
+            display_lines.append(
+                f"  * 强度 Intensity {entry.emotion_intensity}/5 | 能量 Energy {entry.energy_level}/5"
+            )
 
             structured_preview = " | ".join(
                 part
