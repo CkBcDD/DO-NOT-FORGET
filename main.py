@@ -8,9 +8,11 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from textwrap import dedent
 
+from jinja2 import DictLoader, Environment, select_autoescape
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -49,11 +51,56 @@ MOOD_CHOICES = [
     ("不确定 Uncertain", "uncertain"),
     ("其他 Other", "other"),
 ]
+MOOD_DISPLAY_LOOKUP = {value: label for label, value in MOOD_CHOICES}
 
 # Basic logging for debugging and operational visibility
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
+
+TEMPLATE_ENV = Environment(
+    loader=DictLoader(
+        {
+            "entry_detail.html": dedent(
+                """\
+                <div style='font-family:"Segoe UI",sans-serif; line-height:1.6; color:{{ colors.text }};'>
+                    <div style='display:flex; gap:12px; align-items:center; margin-bottom:12px;'>
+                        <div>
+                            <div style='font-size:16px; font-weight:bold;'>{{ timestamp_display }}</div>
+                            <div style='color:{{ colors.secondary }};'>情绪 Mood: {{ mood_display }}</div>
+                        </div>
+                    </div>
+                    {% if structured_fields %}
+                    <div style='margin:8px 0;'>
+                        <ul style='margin:0 0 0 16px; padding:0; color:{{ colors.secondary }};'>
+                            {% for field in structured_fields %}
+                            <li><strong>{{ field.label }}</strong>: {{ field.value | e }}</li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                    <hr style='border:0; height:1px; background:{{ colors.divider }}; margin:12px 0;'>
+                    <p style='white-space:pre-wrap; margin:0;'>
+                        {% if has_body %}{{ body_text | e | replace('\n', '<br>') | safe }}{% else %}<em>{{ empty_body_notice }}</em>{% endif %}
+                    </p>
+                </div>
+                """
+            ),
+            "empty_history.html": dedent(
+                """\
+                <div style='font-family:"Segoe UI",sans-serif; color:{{ colors.secondary }};'>
+                    还没有记录。
+                </div>
+                """
+            ),
+        }
+    ),
+    autoescape=select_autoescape(["html", "xml"]),
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+ENTRY_DETAIL_TEMPLATE = TEMPLATE_ENV.get_template("entry_detail.html")
+EMPTY_HISTORY_TEMPLATE = TEMPLATE_ENV.get_template("empty_history.html")
 
 
 @dataclass
@@ -65,6 +112,71 @@ class JournalEntry:
     body_sensation: str = ""
     trigger_event: str = ""
     need_boundary: str = ""
+
+
+def format_timestamp_display(timestamp: str) -> str:
+    """Render ISO timestamps into a compact, reader-friendly string."""
+
+    if not timestamp:
+        return "未知时间"
+    try:
+        dt = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return timestamp
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def review_theme_colors(dark_mode: bool) -> dict[str, str]:
+    """Choose review pane colors based on the current palette."""
+
+    if dark_mode:
+        return {
+            "text": "#dfe6e9",
+            "secondary": "#a4b0be",
+            "divider": "#3a3f44",
+            "art": "#c8ced3",
+        }
+    return {
+        "text": "#2d3436",
+        "secondary": "#636e72",
+        "divider": "#dfe6e9",
+        "art": "#7f8c8d",
+    }
+
+
+def render_entry_detail_html(entry: JournalEntry, dark_mode: bool = False) -> str:
+    """Render the selected journal entry via the Jinja2 template."""
+
+    colors = review_theme_colors(dark_mode)
+    structured_fields: list[dict[str, str]] = []
+
+    field_specs = (
+        ("身体感受 Body Sensation", entry.body_sensation),
+        ("触发事件 Trigger", entry.trigger_event),
+        ("需求/界限 Need or Boundary", entry.need_boundary),
+    )
+
+    for label, raw_value in field_specs:
+        trimmed = (raw_value or "").strip()
+        if trimmed:
+            structured_fields.append({"label": label, "value": trimmed})
+
+    return ENTRY_DETAIL_TEMPLATE.render(
+        colors=colors,
+        timestamp_display=format_timestamp_display(entry.timestamp),
+        mood_display=MOOD_DISPLAY_LOOKUP.get(entry.mood, entry.mood),
+        structured_fields=structured_fields,
+        body_text=entry.text,
+        has_body=bool(entry.text.strip()),
+        empty_body_notice="（此刻的记录为空）",
+    )
+
+
+def render_empty_history_html(dark_mode: bool) -> str:
+    """Render a friendly empty-state message that respects theme colors."""
+
+    colors = review_theme_colors(dark_mode)
+    return EMPTY_HISTORY_TEMPLATE.render(colors=colors)
 
 
 def initialize_storage(db_path: Path, legacy_json_path: Path) -> None:
@@ -572,6 +684,14 @@ class MemoWindow(QWidget):
                 2000,
             )
 
+    def is_dark_theme(self) -> bool:
+        """Check the current palette to decide whether to render dark-mode art."""
+
+        palette = self.history_content.palette()
+        base_lightness = palette.color(QPalette.ColorRole.Base).lightnessF()
+        window_lightness = palette.color(QPalette.ColorRole.Window).lightnessF()
+        return min(base_lightness, window_lightness) < 0.5
+
     def refresh_history(self) -> None:
         entries = load_journal_entries(DATABASE_PATH)
 
@@ -582,10 +702,12 @@ class MemoWindow(QWidget):
             preview = " ".join(entry.text.strip().split())
             if len(preview) > 48:
                 preview = preview[:47] + "…"
-            display_lines = [
-                entry.timestamp or str(entry.id),
-                f"情绪 Mood: {entry.mood}",
-            ]
+
+            timestamp_display = format_timestamp_display(entry.timestamp)
+            mood_display = MOOD_DISPLAY_LOOKUP.get(entry.mood, entry.mood)
+
+            display_lines = [f"[{timestamp_display}] {mood_display}"]
+
             structured_preview = " | ".join(
                 part
                 for part in (
@@ -595,10 +717,12 @@ class MemoWindow(QWidget):
                 )
                 if part
             )
+
             if structured_preview:
-                display_lines.append(f"结构 Structured: {structured_preview}")
+                display_lines.append(f"  ~ {structured_preview}")
             if preview:
-                display_lines.append(preview)
+                display_lines.append(f"  -> {preview}")
+
             item = QListWidgetItem("\n".join(display_lines))
             item.setData(Qt.ItemDataRole.UserRole, entry)
             self.history_list.addItem(item)
@@ -608,41 +732,28 @@ class MemoWindow(QWidget):
         if entries:
             self.history_list.setCurrentRow(0)
         else:
-            self.history_content.setPlainText("还没有记录。")
+            self.history_content.setHtml(
+                render_empty_history_html(self.is_dark_theme())
+            )
 
     def on_history_selection_changed(self) -> None:
         item = self.history_list.currentItem()
         if item is None:
-            self.history_content.setPlainText("还没有记录。")
+            self.history_content.setHtml(
+                render_empty_history_html(self.is_dark_theme())
+            )
             return
 
         entry = item.data(Qt.ItemDataRole.UserRole)
         if entry is None:
-            self.history_content.setPlainText("还没有记录。")
+            self.history_content.setHtml(
+                render_empty_history_html(self.is_dark_theme())
+            )
             return
 
-        timestamp = entry.timestamp or str(entry.id)
-        mood = entry.mood
-        text = entry.text
-        entry_id = entry.id
-
-        detail_lines = [timestamp, f"情绪 Mood: {mood}"]
-        if entry.body_sensation.strip():
-            detail_lines.append(
-                f"身体感受 Body Sensation: {entry.body_sensation.strip()}"
-            )
-        if entry.trigger_event.strip():
-            detail_lines.append(f"触发事件 Trigger: {entry.trigger_event.strip()}")
-        if entry.need_boundary.strip():
-            detail_lines.append(
-                f"需求/界限 Need or Boundary: {entry.need_boundary.strip()}"
-            )
-        if entry_id:
-            detail_lines.append(f"ID: {entry_id}")
-        detail_lines.append("")
-        detail_lines.append(text)
-
-        self.history_content.setPlainText("\n".join(detail_lines))
+        self.history_content.setHtml(
+            render_entry_detail_html(entry, self.is_dark_theme())
+        )
 
     def export_journal(self) -> None:
         suggested_name = (
