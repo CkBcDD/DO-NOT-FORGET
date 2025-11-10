@@ -13,7 +13,7 @@
 - 情绪选项：直接从下拉框勾选当前情绪基调，既提醒自我觉察，也方便后期按情绪筛选。
 - 温和提醒：最小化到系统托盘，周期性轻提醒，提示你“有感就记”而非“要写长文”。
 - 可回望：以时间序列保存，回顾时能看到“我在不同阶段的情绪图景”。
-- 纯本地：纯文本 json，离线可用、可自备份，无账号与网络依赖。
+- 纯本地：轻量 SQLite 数据库，离线可用、可自备份，无账号与网络依赖。
 
 ## 真实使用场景
 
@@ -45,23 +45,19 @@
 ## 如何实现？
 
 - 超轻交互：启动即写，无分类压力；限制长度（默认 100 字）迫使聚焦核心感受。逻辑见 `ENTRY_CHARACTER_LIMIT` 与输入监听，参见 [`MemoWindow`](main.py)。
-- 安全落档：文本和情绪经 [`escape_entry_for_json`](main.py) 处理后由 [`append_entry_to_journal`](main.py) 附带情绪、唯一 `id` 与时间戳写入 [`JOURNAL_PATH`](main.py)（默认 `journal.json`）。  
+- 安全落档：[`append_entry_to_journal`](main.py) 会把文本、情绪、时间戳和唯一 `id` 写入本地 SQLite 数据库 [`DATABASE_PATH`](main.py)（默认 `journal.sqlite3`）。表结构刻意保持简单：
 
-  ```json
-  {
-    "moments": [
-      {
-        "id": 1731164149,
-        "timestamp": "2025-11-09T22:35:49+08:00",
-        "mood": "calm",
-        "text": "轻盈而笃定"
-      }
-    ]
-  }
+  ```sql
+  CREATE TABLE moments (
+      id INTEGER PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      mood TEXT NOT NULL,
+      text TEXT NOT NULL
+  );
   ```
 
 - 不打扰的提醒：窗口最小化到系统托盘；周期提醒（[`GENTLE_REMINDER_INTERVAL_MS`](main.py) 默认 1000ms 示例值，可调）唤起“记录当下”意识。
-- 本地纯文本：无需账号，无网络依赖，降低遗失与泄露风险。
+- 本地 SQLite 文件：无需账号，无网络依赖，降低遗失与泄露风险。
 - 入口函数 [`main`](main.py) 负责应用生命周期；托盘逻辑与最小化行为由 `MemoWindow` 内部方法统一管理。
 
 ## 设计取舍
@@ -92,7 +88,7 @@ py -3.13 main.py
 1. 启动后先在“情绪 Mood”下拉框中选定当前的情绪基调。
 2. 在输入框里浓缩触动来源、身体感受或突发的动力念头。
 3. 观察右下角计数，保持精炼（有意的长度限制帮助萃取“情感核心”）。
-4. 点击“Archive to json”立即归档至 `data.json`。
+4. 点击“Archive to Journal”立即归档至 `journal.sqlite3`。
 5. 关闭窗口时程序进入托盘并定期提示“别忘了记录”；需要时单击托盘图标恢复。
 
 ## 常见问题
@@ -104,20 +100,20 @@ py -3.13 main.py
 - 提醒太频繁/太稀疏？  
   在 `main.py` 中调整 `GENTLE_REMINDER_INTERVAL_MS`（毫秒）。
 - 数据存哪儿？  
-  默认 `data.json`（见 `JOURNAL_PATH`）。建议定期复制到你的同步盘或手动备份。
+  默认 `journal.sqlite3`（见 `DATABASE_PATH`）。建议定期复制到你的同步盘或手动备份。
 - 想自定义情绪选项？  
   在 `main.py` 中调整 `MOOD_CHOICES` 列表，可同时修改显示文案与存储值。
 - 多设备同步？  
-  目前不内置云同步，可用你自己的网盘/版本控制托管该 json 文件。
+  目前不内置云同步，可用你自己的网盘/版本控制托管该 SQLite 文件。
 
 ## 隐私与数据
 
-- 数据以纯文本 json 保存在本地，便于备份、迁移与后续分析（如导入到数据工具）。
+- 数据以轻量 SQLite 数据库存放在本地，便于备份、迁移与后续分析（如直接查询或导出 CSV）。
 - 不采集、不上传——你的情绪只属于你。
 
 ## 回望与复盘（可选）
 
-每周或每月，挑一个固定时段滚动浏览 `data.json`，回答三件事：
+每周或每月，挑一个固定时段查看 `journal.sqlite3`（或导出的视图），回答三件事：
 
 - 哪些瞬间最有能量？它们的共性是什么？
 - 哪些反复出现的“刺痛点”在提醒我设定边界或做出调整？

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -26,7 +29,8 @@ from PySide6.QtWidgets import (
 )
 
 ENTRY_CHARACTER_LIMIT = 100
-JOURNAL_PATH = Path("journal.json")
+DATABASE_PATH = Path("journal.sqlite3")
+LEGACY_JSON_PATH = Path("journal.json")
 GENTLE_REMINDER_INTERVAL_MS = 10 * 60 * 1000
 MOOD_CHOICES = [
     ("平静 Calm", "calm"),
@@ -42,58 +46,161 @@ MOOD_CHOICES = [
     ("其他 Other", "other"),
 ]
 
-
-def append_entry_to_journal(text: str, mood: str, path: Path) -> None:
-    now = datetime.now().astimezone()
-    timestamp = now.isoformat(timespec="seconds")
-    entry_id = int(now.timestamp())
-
-    new_entry = {"id": entry_id, "timestamp": timestamp, "mood": mood, "text": text}
-
-    # Load existing moments
-    moments = []
-    if path.exists() and path.stat().st_size > 0:
-        try:
-            with path.open("r", encoding="utf-8") as file:
-                data = json.load(file)
-                moments = data.get("moments", [])
-        except (OSError, json.JSONDecodeError):
-            moments = []
-
-    # Append new moment
-    moments.append(new_entry)
-
-    # Save back to file
-    data = {"moments": moments}
-    with path.open("w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
+# Basic logging for debugging and operational visibility
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 
 
-def load_journal_entries(path: Path) -> list[dict[str, str]]:
-    if not path.exists() or path.stat().st_size == 0:
-        return []
+@dataclass
+class JournalEntry:
+    id: int
+    timestamp: str
+    mood: str
+    text: str
+
+
+def initialize_storage(db_path: Path, legacy_json_path: Path) -> None:
+    """Ensure the SQLite storage exists and migrate legacy JSON if present."""
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        with path.open("r", encoding="utf-8") as file:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS moments (
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    mood TEXT NOT NULL,
+                    text TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_moments_timestamp ON moments(timestamp)"
+            )
+    except sqlite3.DatabaseError:
+        logging.exception("Failed to initialize journal database at %s", db_path)
+        raise
+
+    migrate_legacy_json(legacy_json_path, db_path)
+
+
+def migrate_legacy_json(json_path: Path, db_path: Path) -> None:
+    """Import legacy JSON moments into SQLite, preserving the original file."""
+
+    if not json_path.exists() or json_path.stat().st_size == 0:
+        return
+
+    try:
+        with json_path.open("r", encoding="utf-8") as file:
             data = json.load(file)
     except (OSError, json.JSONDecodeError):
-        return []
+        logging.exception("Failed to read legacy journal JSON from %s", json_path)
+        return
 
-    raw_moments = data.get("moments", [])
-    entries: list[dict[str, str]] = []
+    raw_moments = data.get("moments", []) if isinstance(data, dict) else []
+    payload: list[tuple[int, str, str, str]] = []
     for entry in raw_moments:
         if not isinstance(entry, dict):
             continue
-        entries.append(
-            {
-                "id": str(entry.get("id", "")),
-                "timestamp": str(entry.get("timestamp", "")),
-                "mood": str(entry.get("mood", "unspecified")),
-                "text": str(entry.get("text", "")),
-            }
-        )
+        try:
+            entry_id = int(entry.get("id", 0)) if entry.get("id") is not None else 0
+            timestamp = str(entry.get("timestamp", ""))
+            mood = str(entry.get("mood", "unspecified"))
+            text = str(entry.get("text", ""))
+        except (TypeError, ValueError):
+            logging.exception(
+                "Skipping invalid legacy entry during migration: %s", entry
+            )
+            continue
+        payload.append((entry_id, timestamp, mood, text))
 
-    entries.sort(key=lambda item: item["timestamp"] or item["id"], reverse=True)
+    if not payload:
+        return
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            existing = conn.execute("SELECT COUNT(*) FROM moments").fetchone()[0]
+            if existing:
+                logging.info("Skipping legacy migration; database already has entries.")
+                return
+            conn.executemany(
+                "INSERT OR IGNORE INTO moments (id, timestamp, mood, text) VALUES (?, ?, ?, ?)",
+                payload,
+            )
+            logging.info(
+                "Migrated %d legacy journal entries into SQLite storage.", len(payload)
+            )
+    except sqlite3.DatabaseError:
+        logging.exception("Failed to migrate legacy JSON moments into SQLite.")
+
+
+def append_entry_to_journal(text: str, mood: str, db_path: Path) -> None:
+    """Persist a new journal entry into the SQLite database."""
+
+    now = datetime.now().astimezone()
+    timestamp = now.isoformat(timespec="seconds")
+    entry_id = int(now.timestamp() * 1000)
+
+    new_entry = JournalEntry(id=entry_id, timestamp=timestamp, mood=mood, text=text)
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            for attempt in range(3):
+                try:
+                    conn.execute(
+                        "INSERT INTO moments (id, timestamp, mood, text) VALUES (?, ?, ?, ?)",
+                        (
+                            new_entry.id,
+                            new_entry.timestamp,
+                            new_entry.mood,
+                            new_entry.text,
+                        ),
+                    )
+                    break
+                except sqlite3.IntegrityError:
+                    new_entry.id += 1
+            else:
+                raise sqlite3.IntegrityError(
+                    "Failed to generate unique journal entry ID"
+                )
+    except sqlite3.DatabaseError:
+        logging.exception("Failed to append journal entry to database.")
+        raise
+
+
+def load_journal_entries(db_path: Path) -> list[JournalEntry]:
+    """Load journal entries from SQLite ordered by timestamp descending."""
+
+    if not db_path.exists():
+        return []
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, timestamp, mood, text FROM moments ORDER BY timestamp DESC, id DESC"
+            ).fetchall()
+    except sqlite3.DatabaseError:
+        logging.exception("Failed to load journal entries from SQLite.")
+        return []
+
+    entries: list[JournalEntry] = []
+    for row in rows:
+        try:
+            entries.append(
+                JournalEntry(
+                    id=int(row["id"]) if row["id"] is not None else 0,
+                    timestamp=str(row["timestamp"] or ""),
+                    mood=str(row["mood"] or "unspecified"),
+                    text=str(row["text"] or ""),
+                )
+            )
+        except (TypeError, ValueError):
+            logging.exception("Skipping malformed database row: %s", dict(row))
+
     return entries
 
 
@@ -123,7 +230,7 @@ class MemoWindow(QWidget):
         self.counter.setAlignment(Qt.AlignmentFlag.AlignRight)
         layout.addWidget(self.counter)
 
-        self.save_button = QPushButton("Archive to JSON")
+        self.save_button = QPushButton("Archive to Journal")
         self.save_button.clicked.connect(self.archive_entry)
         layout.addWidget(self.save_button)
 
@@ -189,16 +296,26 @@ class MemoWindow(QWidget):
         self.counter.setText(f"{len(text)} / {ENTRY_CHARACTER_LIMIT}")
 
     def archive_entry(self) -> None:
-        text = self.text_edit.toPlainText()
+        text = self.text_edit.toPlainText().strip()
+        if not text:
+            QMessageBox.warning(
+                self, "Empty Entry", "Please enter some text before archiving."
+            )
+            return
+
+        if len(text) > ENTRY_CHARACTER_LIMIT:
+            text = text[:ENTRY_CHARACTER_LIMIT]
+
         mood = self.mood_selector.currentData() or "unspecified"
         try:
-            append_entry_to_journal(text, mood, JOURNAL_PATH)
-        except OSError as exc:
+            append_entry_to_journal(text, mood, DATABASE_PATH)
+        except Exception as exc:  # broad catch to surface unexpected errors
+            logging.exception("Failed to archive entry")
             QMessageBox.critical(self, "Archive Failed", f"Could not save file: {exc}")
             return
 
         QMessageBox.information(
-            self, "Archived", f"Entry archived to {JOURNAL_PATH.resolve()}"
+            self, "Archived", f"Entry archived to {DATABASE_PATH.resolve()}"
         )
 
         self.text_edit.clear()
@@ -261,18 +378,18 @@ class MemoWindow(QWidget):
             )
 
     def refresh_history(self) -> None:
-        entries = load_journal_entries(JOURNAL_PATH)
+        entries = load_journal_entries(DATABASE_PATH)
 
         self.history_list.blockSignals(True)
         self.history_list.clear()
 
         for entry in entries:
-            preview = " ".join(entry["text"].strip().split())
+            preview = " ".join(entry.text.strip().split())
             if len(preview) > 48:
                 preview = preview[:47] + "…"
             display_lines = [
-                entry["timestamp"] or entry["id"],
-                f"情绪 Mood: {entry['mood']}",
+                entry.timestamp or str(entry.id),
+                f"情绪 Mood: {entry.mood}",
             ]
             if preview:
                 display_lines.append(preview)
@@ -293,11 +410,15 @@ class MemoWindow(QWidget):
             self.history_content.setPlainText("还没有记录。")
             return
 
-        entry = item.data(Qt.ItemDataRole.UserRole) or {}
-        timestamp = entry.get("timestamp", "") or entry.get("id", "")
-        mood = entry.get("mood", "unspecified")
-        text = entry.get("text", "")
-        entry_id = entry.get("id", "")
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if entry is None:
+            self.history_content.setPlainText("还没有记录。")
+            return
+
+        timestamp = entry.timestamp or str(entry.id)
+        mood = entry.mood
+        text = entry.text
+        entry_id = entry.id
 
         detail_lines = [timestamp, f"情绪 Mood: {mood}"]
         if entry_id:
@@ -308,14 +429,15 @@ class MemoWindow(QWidget):
         self.history_content.setPlainText("\n".join(detail_lines))
 
 
-def main() -> None:
+def main() -> int:
+    initialize_storage(DATABASE_PATH, LEGACY_JSON_PATH)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     window = MemoWindow()
     window.resize(520, 520)
     window.show()
-    sys.exit(app.exec())
+    return int(app.exec())
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
