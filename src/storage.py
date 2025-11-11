@@ -364,43 +364,85 @@ def load_journal_entries(
 
 
 def export_journal_to_csv(db_path: Path, csv_path: Path) -> int:
-    """Write journal entries to a CSV file and return the number of rows exported."""
-    entries = load_journal_entries(db_path)
+    """Write journal entries to a CSV file and return the number of rows exported.
+
+    Uses streaming export to avoid loading all entries into memory at once,
+    which reduces memory usage and improves performance for large datasets.
+    """
+    if not db_path.exists():
+        return 0
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        with csv_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(
-                [
-                    "id",
-                    "timestamp",
-                    "mood",
-                    "text",
-                    "body_sensation",
-                    "trigger_event",
-                    "need_boundary",
-                    "emotion_intensity",
-                    "energy_level",
-                ]
+        with sqlite3.connect(db_path) as conn:
+            apply_sqlite_pragmas(conn)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                """
+                SELECT
+                    id,
+                    timestamp,
+                    mood,
+                    text,
+                    body_sensation,
+                    trigger_event,
+                    need_boundary,
+                    emotion_intensity,
+                    energy_level
+                FROM moments
+                ORDER BY timestamp ASC, id ASC
+                """
             )
-            for entry in reversed(entries):
-                writer.writerow(
-                    [
-                        entry.id,
-                        entry.timestamp,
-                        entry.mood,
-                        entry.text,
-                        entry.body_sensation,
-                        entry.trigger_event,
-                        entry.need_boundary,
-                        entry.emotion_intensity,
-                        entry.energy_level,
-                    ]
-                )
+            return _write_entries_to_csv(cursor, csv_path)
+    except sqlite3.DatabaseError:
+        logging.exception("Failed to export journal entries from SQLite.")
+        raise
     except OSError:
         logging.exception("Failed to write journal CSV export to %s", csv_path)
         raise
 
-    return len(entries)
+
+def _write_entries_to_csv(cursor: sqlite3.Cursor, csv_path: Path) -> int:
+    """Write database cursor rows to CSV file using streaming approach."""
+    row_count = 0
+    batch_size = 1000
+
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "id",
+                "timestamp",
+                "mood",
+                "text",
+                "body_sensation",
+                "trigger_event",
+                "need_boundary",
+                "emotion_intensity",
+                "energy_level",
+            ]
+        )
+
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                break
+
+            for row in rows:
+                writer.writerow(
+                    [
+                        row["id"],
+                        row["timestamp"],
+                        row["mood"],
+                        row["text"],
+                        row["body_sensation"],
+                        row["trigger_event"],
+                        row["need_boundary"],
+                        row["emotion_intensity"],
+                        row["energy_level"],
+                    ]
+                )
+                row_count += 1
+
+    return row_count
