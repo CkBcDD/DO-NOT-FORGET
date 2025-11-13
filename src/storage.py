@@ -58,6 +58,7 @@ def initialize_storage(db_path: Path, legacy_json_path: Path) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_moments_timestamp ON moments(timestamp)"
             )
             ensure_structured_fields(conn)
+            migrate_intensity_to_real(conn)
     except sqlite3.DatabaseError:
         logging.exception("Failed to initialize journal database at %s", db_path)
         raise
@@ -96,6 +97,72 @@ def ensure_structured_fields(conn: sqlite3.Connection) -> None:
             raise
 
 
+def migrate_intensity_to_real(conn: sqlite3.Connection) -> None:
+    """将emotion_intensity和energy_level从INTEGER迁移到REAL类型以支持0.5档位。"""
+    try:
+        # 检查列类型
+        table_info = conn.execute("PRAGMA table_info(moments)").fetchall()
+        columns = {col[1]: col[2] for col in table_info}  # name: type
+
+        # 如果字段已经是REAL类型,无需迁移
+        if (
+            columns.get("emotion_intensity") == "REAL"
+            and columns.get("energy_level") == "REAL"
+        ):
+            return
+
+        # 如果字段不存在或是INTEGER类型,需要迁移
+        if "emotion_intensity" in columns or "energy_level" in columns:
+            # SQLite不支持直接ALTER COLUMN类型,需要重建表
+            conn.execute("BEGIN TRANSACTION")
+
+            # 创建新表
+            conn.execute("""
+                CREATE TABLE moments_new (
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    mood TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    body_sensation TEXT NOT NULL DEFAULT '',
+                    trigger_event TEXT NOT NULL DEFAULT '',
+                    need_boundary TEXT NOT NULL DEFAULT '',
+                    emotion_intensity REAL NOT NULL DEFAULT 3.0,
+                    energy_level REAL NOT NULL DEFAULT 3.0
+                )
+            """)
+
+            # 复制数据,将整数转换为浮点数
+            conn.execute("""
+                INSERT INTO moments_new
+                SELECT id, timestamp, mood, text, body_sensation, trigger_event,
+                       need_boundary,
+                       CAST(emotion_intensity AS REAL),
+                       CAST(energy_level AS REAL)
+                FROM moments
+            """)
+
+            # 删除旧表
+            conn.execute("DROP TABLE moments")
+
+            # 重命名新表
+            conn.execute("ALTER TABLE moments_new RENAME TO moments")
+
+            # 重建索引
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_moments_timestamp ON moments(timestamp)"
+            )
+
+            conn.execute("COMMIT")
+            logging.info(
+                "Successfully migrated emotion_intensity and energy_level to REAL type"
+            )
+
+    except sqlite3.DatabaseError:
+        conn.execute("ROLLBACK")
+        logging.exception("Failed to migrate intensity fields to REAL type")
+        raise
+
+
 def migrate_legacy_json(json_path: Path, db_path: Path) -> None:
     """Import legacy JSON moments into SQLite, preserving the original file."""
     if not json_path.exists() or json_path.stat().st_size == 0:
@@ -109,7 +176,7 @@ def migrate_legacy_json(json_path: Path, db_path: Path) -> None:
         return
 
     raw_moments = data.get("moments", []) if isinstance(data, dict) else []
-    payload: list[tuple[int, str, str, str, str, str, str, int, int]] = []
+    payload: list[tuple[int, str, str, str, str, str, str, float, float]] = []
     for entry in raw_moments:
         if not isinstance(entry, dict):
             continue
@@ -130,8 +197,8 @@ def migrate_legacy_json(json_path: Path, db_path: Path) -> None:
             body_sensation = body_sensation.strip()[:30]
             trigger_event = trigger_event.strip()[:30]
             need_boundary = need_boundary.strip()[:30]
-            emotion_intensity = clamp_scale_value(entry.get("emotion_intensity"), 3)
-            energy_level = clamp_scale_value(entry.get("energy_level"), 3)
+            emotion_intensity = clamp_scale_value(entry.get("emotion_intensity"), 3.0)
+            energy_level = clamp_scale_value(entry.get("energy_level"), 3.0)
         except (TypeError, ValueError):
             logging.exception(
                 "Skipping invalid legacy entry during migration: %s", entry
@@ -192,13 +259,13 @@ def append_entry_to_journal(
     body_sensation: str = "",
     trigger_event: str = "",
     need_boundary: str = "",
-    emotion_intensity: int = 3,
-    energy_level: int = 3,
+    emotion_intensity: float = 3.0,
+    energy_level: float = 3.0,
     cache: EntryCache | None = None,
 ) -> None:
     """将新的 journal 条目持久化到 SQLite 数据库。
 
-    如果提供了缓存对象，会自动将新条目添加到缓存中，避免下次 refresh 时的 DB 查询。
+    如果提供了缓存对象,会自动将新条目添加到缓存中,避免下次 refresh 时的 DB 查询。
 
     Args:
         text: 条目内容文本
@@ -207,9 +274,9 @@ def append_entry_to_journal(
         body_sensation: 身体感受
         trigger_event: 触发事件
         need_boundary: 需求/界限
-        emotion_intensity: 情绪强度 (1-5)
-        energy_level: 能量水平 (1-5)
-        cache: 可选缓存对象，用于增量更新
+        emotion_intensity: 情绪强度 (1.0-5.0, 支持0.5档位)
+        energy_level: 能量水平 (1.0-5.0, 支持0.5档位)
+        cache: 可选缓存对象,用于增量更新
     """
     from datetime import datetime
 

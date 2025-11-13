@@ -16,8 +16,8 @@ class JournalEntry:
     body_sensation: str = ""
     trigger_event: str = ""
     need_boundary: str = ""
-    emotion_intensity: int = 3
-    energy_level: int = 3
+    emotion_intensity: float = 3.0
+    energy_level: float = 3.0
 
 
 class EntryCache:

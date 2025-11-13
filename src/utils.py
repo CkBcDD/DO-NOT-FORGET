@@ -12,13 +12,16 @@ from src.constants import (
 from src.models import JournalEntry
 
 
-def clamp_scale_value(raw: object, default: int = 3) -> int:
-    """Convert raw slider-like values to the canonical 1-5 scale."""
+def clamp_scale_value(raw: object, default: float = 3.0) -> float:
+    """Convert raw slider-like values to the canonical 1.0-5.0 scale (with 0.5 increments)."""
     try:
-        value = int(raw)  # type: ignore[arg-type]
+        value = float(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         value = default
-    return max(1, min(5, value))
+    # 限制在1.0-5.0范围内
+    clamped = max(1.0, min(5.0, value))
+    # 四舍五入到最近的0.5
+    return round(clamped * 2) / 2
 
 
 def format_timestamp_display(timestamp: str) -> str:
